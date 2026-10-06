@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="nl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#02070d"><link rel="manifest" href="manifest.json"><link rel="icon" href="icon.svg">
+<title>Jarvis</title>
+<style>
+:root{--bg:#02070d;--arc:#5ff3ff;--amber:#ffb347;--ink:#d9fbff;--dim:#5a8a94;--line:#12323a}
+*{box-sizing:border-box;margin:0}
+html,body{height:100%;background:var(--bg);color:var(--ink);font-family:"Rajdhani","Segoe UI",system-ui,sans-serif;overflow:hidden;-webkit-tap-highlight-color:transparent}
+canvas{position:fixed;inset:0;width:100%;height:100%}
+.hud{position:fixed;inset:0;display:flex;flex-direction:column;justify-content:space-between;padding:calc(14px + env(safe-area-inset-top,0px)) 16px calc(14px + env(safe-area-inset-bottom,0px));pointer-events:none}
+.top{display:flex;justify-content:space-between;align-items:flex-start;font-size:15px;color:var(--dim)}
+#clock{font-size:34px;color:var(--arc);font-weight:300;letter-spacing:2px}
+#state{text-align:right;color:var(--arc)}
+.log{max-height:34vh;overflow:hidden;display:flex;flex-direction:column;justify-content:flex-end;gap:6px;font-size:19px;line-height:1.25;margin-bottom:10px;text-shadow:0 0 12px #000}
+.log .u{color:var(--dim)}.log .j{color:var(--ink);border-left:2px solid var(--arc);padding-left:10px}
+.bar{display:flex;gap:8px;pointer-events:auto;align-items:center}
+.bar input{flex:1;min-width:0;background:#06141aaa;border:1px solid var(--line);color:var(--ink);padding:11px 14px;border-radius:22px;font:inherit;font-size:17px;outline:none}
+.bar input:focus{border-color:var(--arc)}
+button{background:#06141acc;border:1px solid var(--line);color:var(--arc);width:46px;height:46px;border-radius:50%;font-size:20px;cursor:pointer;flex:none}
+button:focus-visible{outline:2px solid var(--arc)}
+#mic.on{background:var(--arc);color:var(--bg);box-shadow:0 0 22px var(--arc)}
+dialog{background:#06141a;color:var(--ink);border:1px solid var(--arc);border-radius:14px;padding:20px;width:min(92vw,440px);max-height:90vh;overflow:auto}
+dialog::backdrop{background:#000b}
+dialog h2{color:var(--arc);font-weight:500;margin-bottom:12px}
+dialog label{display:block;margin:12px 0 4px;color:var(--dim)}
+dialog input,dialog select{width:100%;background:#02070d;border:1px solid var(--line);color:var(--ink);padding:9px;border-radius:8px;font:inherit}
+.row{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
+.row button,.wide{width:auto;height:auto;border-radius:8px;padding:9px 14px;font:inherit;font-size:16px}
+small{display:block;color:var(--dim);margin-top:10px;line-height:1.3}
+@media (prefers-reduced-motion:reduce){canvas{opacity:.85}}
+</style></head><body>
+<canvas id="c"></canvas>
+<div class="hud">
+ <div class="top"><div><div id="clock">--:--</div><div id="mem">geheugen: laden…</div></div><div id="state">offline</div></div>
+ <div>
+  <div class="log" id="log"></div>
+  <div class="bar">
+   <button id="mic" title="Luisteren aan/uit" aria-label="Luisteren aan/uit">🎙</button>
+   <input id="txt" placeholder="Typ of zeg “Hey Jarvis”…" autocomplete="off">
+   <button id="fs" title="Volledig scherm" aria-label="Volledig scherm">⛶</button>
+   <button id="cfg" title="Instellingen" aria-label="Instellingen">⚙</button>
+  </div>
+ </div>
+</div>
+<dialog id="dlg"><h2>Instellingen</h2>
+ <label>Claude API-key</label><input id="key" type="password" placeholder="sk-ant-…" autocomplete="off">
+ <label>Model</label><input id="model" value="claude-sonnet-5-5">
+ <label>Stem</label><select id="voice"></select>
+ <label>Spreeksnelheid</label><input id="rate" type="range" min="0.7" max="1.4" step="0.05" value="1">
+ <label>Jouw naam</label><input id="uname" placeholder="bijv. Tony">
+ <div class="row"><button class="wide" id="save">Opslaan</button><button class="wide" id="bk">Backup maken</button><button class="wide" id="rs">Backup terugzetten</button><button class="wide" id="close">Sluiten</button></div>
+ <input type="file" id="file" accept=".gz,.jarvis" hidden>
+ <small>De API-key blijft alleen op dit apparaat. Oude gesprekken worden automatisch samengevat en gecomprimeerd (gzip) in het geheugen; een backup bevat alles.</small>
+</dialog>
+<script>
+const $=id=>document.getElementById(id);
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+let S={key:'',model:'claude-sonnet-5-5',voice:'',rate:1,uname:''};
+let mem={summary:'',messages:[]}; let state='offline',listening=false,speaking=false,followUntil=0,wantMic=false,rec;
+try{Object.assign(S,JSON.parse(localStorage.getItem('jarvis-s')||'{}'))}catch(e){}
+
+/* ---------- opslag (IndexedDB) + compressie ---------- */
+const db=new Promise((res,rej)=>{const r=indexedDB.open('jarvis',1);r.onupgradeneeded=()=>r.result.createObjectStore('kv');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)});
+const kv=async(m,fn)=>{const d=await db;return new Promise((res,rej)=>{const t=d.transaction('kv',m),s=t.objectStore('kv');const q=fn(s);t.oncomplete=()=>res(q&&q.result);t.onerror=()=>rej(t.error)})};
+const kget=k=>kv('readonly',s=>s.get(k)),kset=(k,v)=>kv('readwrite',s=>s.put(v,k));
+const kkeys=()=>kv('readonly',s=>s.getAllKeys());
+const gz=async s=>new Response(new Blob([s]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();
+const gunz=async b=>new Response(new Blob([b]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+const b64=b=>{let s='';new Uint8Array(b).forEach(x=>s+=String.fromCharCode(x));return btoa(s)};
+const unb64=t=>Uint8Array.from(atob(t),c=>c.charCodeAt(0)).buffer;
+const save=()=>kset('mem',mem);
+async function stats(){const k=(await kkeys()).filter(x=>String(x).startsWith('arch:')).length;
+ $('mem').textContent=`geheugen: ${mem.messages.length} recent · ${k} archieven`+(mem.summary?' · samenvatting actief':'')}
+
+/* ---------- Claude ---------- */
+async function claude(system,messages,max=700){
+ const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'content-type':'application/json','x-api-key':S.key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+  body:JSON.stringify({model:S.model,max_tokens:max,system,messages})});
+ const d=await r.json(); if(!r.ok)throw new Error(d.error?.message||r.status);
+ return d.content.filter(b=>b.type==='text').map(b=>b.text).join('\n').trim()}
+const sysPrompt=()=>`Je bent JARVIS, de intelligente, beleefde en licht droogkomische AI-assistent uit Iron Man. Antwoord in het Nederlands, tenzij de gebruiker een andere taal spreekt. Je antwoorden worden hardop uitgesproken: houd ze kort (1-3 zinnen), zonder markdown, lijstjes of emoji.${S.uname?` Spreek de gebruiker aan als ${S.uname}.`:''} Huidige datum en tijd: ${new Date().toLocaleString('nl-NL')}.${mem.summary?`\n\nLangetermijngeheugen over de gebruiker en eerdere gesprekken:\n${mem.summary}`:''}`;
+
+async function compact(){ // geheugen comprimeren als het te groot wordt
+ if(mem.messages.length<40)return;
+ const old=mem.messages.splice(0,24);
+ await kset('arch:'+Date.now(),await gz(JSON.stringify(old)));
+ try{const t=old.map(m=>(m.role==='user'?'Gebruiker: ':'Jarvis: ')+m.content).join('\n');
+  mem.summary=await claude('Werk een geheugensamenvatting bij. Behoud feiten over de gebruiker, voorkeuren, afspraken en lopende onderwerpen. Maximaal 400 woorden, platte tekst.',[{role:'user',content:`Bestaande samenvatting:\n${mem.summary||'(leeg)'}\n\nNieuwe gesprekken:\n${t}`}],900)}catch(e){}
+ await save();stats()}
+
+/* ---------- gesprek ---------- */
+function say(cls,t){const d=document.createElement('div');d.className=cls;d.textContent=t;$('log').appendChild(d);while($('log').children.length>4)$('log').firstChild.remove();return d}
+async function handle(text){
+ text=text.trim();if(!text)return;say('u',text);
+ if(!S.key){reply('Voer eerst je API-key in via de instellingen.');$('dlg').showModal();return}
+ setState('thinking');mem.messages.push({role:'user',content:text});
+ try{const a=await claude(sysPrompt(),mem.messages.slice(-20));mem.messages.push({role:'assistant',content:a});await save();reply(a);compact()}
+ catch(e){mem.messages.pop();reply('Er ging iets mis: '+e.message)}}
+function reply(t){say('j',t);speak(t)}
+function speak(t){speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.lang='nl-NL';u.rate=+S.rate||1;
+ const v=speechSynthesis.getVoices().find(v=>v.name===S.voice);if(v){u.voice=v;u.lang=v.lang}
+ u.onstart=()=>{speaking=true;setState('speaking');try{rec&&rec.stop()}catch(e){}};
+ u.onend=u.onerror=()=>{speaking=false;followUntil=Date.now()+7000;setState(wantMic?'listening':'idle');startRec()};
+ speechSynthesis.speak(u)}
+
+/* ---------- spraak + wake word ---------- */
+const WAKE=/\b(?:hey|hé|hee|hai|hoi|ok|oké|okay)?\s*(?:jarvis|jarvies|jervis|harvest|jarvas|service)\b[\s,.!?]*/i;
+function startRec(){
+ if(!SR||!wantMic||speaking)return;
+ rec=new SR();rec.lang='nl-NL';rec.continuous=true;rec.interimResults=false;
+ rec.onresult=e=>{for(let i=e.resultIndex;i<e.results.length;i++){if(!e.results[i].isFinal)continue;
+  const t=e.results[i][0].transcript.trim();const m=t.match(WAKE);
+  if(m){const cmd=t.slice(m.index+m[0].length).trim();followUntil=Date.now()+8000;setState('listening');if(cmd.length>1)handle(cmd);else{chime()}}
+  else if(Date.now()<followUntil)handle(t)}};
+ rec.onend=()=>{if(wantMic&&!speaking)setTimeout(startRec,250)};
+ rec.onerror=e=>{if(e.error==='not-allowed'){wantMic=false;$('mic').classList.remove('on');setState('offline');say('j','Microfoontoegang geweigerd.')}};
+ try{rec.start();setState(Date.now()<followUntil?'listening':'idle')}catch(e){}}
+function chime(){try{const a=new AudioContext(),o=a.createOscillator(),g=a.createGain();o.frequency.value=880;g.gain.value=.08;o.connect(g);g.connect(a.destination);o.start();o.stop(a.currentTime+.12)}catch(e){}}
+$('mic').onclick=()=>{if(!SR){say('j','Spraakherkenning wordt niet ondersteund in deze browser. Gebruik Chrome.');return}
+ wantMic=!wantMic;$('mic').classList.toggle('on',wantMic);
+ if(wantMic){startRec();say('j','Ik luister. Zeg “Hey Jarvis”.')}else{try{rec.stop()}catch(e){}setState('offline')}};
+$('txt').onkeydown=e=>{if(e.key==='Enter'){handle($('txt').value);$('txt').value=''}};
+$('fs').onclick=()=>document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen?.();
+
+/* ---------- instellingen + backup ---------- */
+function fillVoices(){const v=speechSynthesis.getVoices().filter(v=>/nl|en/i.test(v.lang));$('voice').innerHTML='<option value="">Standaard (NL)</option>'+v.map(x=>`<option ${x.name===S.voice?'selected':''}>${x.name}</option>`).join('')}
+speechSynthesis.onvoiceschanged=fillVoices;fillVoices();
+$('cfg').onclick=()=>{$('key').value=S.key;$('model').value=S.model;$('rate').value=S.rate;$('uname').value=S.uname;fillVoices();$('dlg').showModal()};
+$('close').onclick=()=>$('dlg').close();
+$('save').onclick=()=>{S={key:$('key').value.trim(),model:$('model').value.trim()||'claude-sonnet-5-5',voice:$('voice').value,rate:$('rate').value,uname:$('uname').value.trim()};localStorage.setItem('jarvis-s',JSON.stringify(S));$('dlg').close();say('j','Instellingen opgeslagen.')};
+$('bk').onclick=async()=>{const keys=await kkeys(),arch={};for(const k of keys)if(String(k).startsWith('arch:'))arch[k]=b64(await kget(k));
+ const blob=new Blob([await gz(JSON.stringify({v:1,mem,arch}))],{type:'application/gzip'});
+ const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`jarvis-backup-${new Date().toISOString().slice(0,10)}.jarvis.gz`;a.click();say('j','Backup gemaakt, gecomprimeerd en gedownload.')};
+$('rs').onclick=()=>$('file').click();
+$('file').onchange=async e=>{try{const d=JSON.parse(await gunz(await e.target.files[0].arrayBuffer()));mem=d.mem;await save();for(const k in d.arch)await kset(k,unb64(d.arch[k]));stats();say('j','Geheugen hersteld uit backup.')}catch(x){say('j','Backup kon niet worden gelezen.')}$('dlg').close()};
+
+/* ---------- visuals: arc-reactor orb ---------- */
+const cv=$('c'),g=cv.getContext('2d');let W,H,dpr;
+function size(){dpr=Math.min(devicePixelRatio||1,2);W=cv.width=innerWidth*dpr;H=cv.height=innerHeight*dpr}addEventListener('resize',size);size();
+function setState(s){state=s;$('state').textContent={offline:'offline',idle:'wacht op “Hey Jarvis”',listening:'luistert',thinking:'denkt na…',speaking:'spreekt'}[s]}
+let lvl=0;
+function draw(t){t/=1000;g.clearRect(0,0,W,H);
+ const cx=W/2,cy=H*0.42,R=Math.min(W,H*0.8)*0.3;
+ const col=state==='thinking'?'255,179,71':'95,243,255';
+ const target={offline:.05,idle:.12,listening:.55,thinking:.3,speaking:.5+.5*Math.abs(Math.sin(t*9)*Math.sin(t*3.7))}[state];
+ lvl+=(target-lvl)*.08;
+ const gl=g.createRadialGradient(cx,cy,0,cx,cy,R*2);gl.addColorStop(0,`rgba(${col},${.12+lvl*.3})`);gl.addColorStop(1,'rgba(2,7,13,0)');g.fillStyle=gl;g.fillRect(0,0,W,H);
+ g.lineCap='round';
+ const spin=state==='thinking'?3:1;
+ const rings=[[1.0,2,[2,0],.25],[.86,3,[40,14],-.5*spin],[.7,2,[6,10],.8*spin],[.55,5,[90,30],-1.1*spin],[.4,2,[2,0],0]];
+ rings.forEach(([k,w,dash,sp],i)=>{g.save();g.translate(cx,cy);g.rotate(t*sp);
+  g.strokeStyle=`rgba(${col},${.35+lvl*.6-i*.04})`;g.lineWidth=w*dpr;g.setLineDash(dash.map(d=>d*dpr));
+  g.beginPath();g.arc(0,0,R*k*(1+lvl*.04*(i%2?1:-1)*Math.sin(t*4+i)),0,7);g.stroke();g.restore()});
+ g.save();g.translate(cx,cy);g.rotate(-t*.4);g.strokeStyle=`rgba(${col},.8)`;g.lineWidth=2*dpr;g.setLineDash([]);
+ for(let i=0;i<48;i++){const a=i/48*6.283,len=R*(.08+lvl*.22*(.5+.5*Math.sin(t*6+i*1.7)));
+  g.beginPath();g.moveTo(Math.cos(a)*R*1.08,Math.sin(a)*R*1.08);g.lineTo(Math.cos(a)*(R*1.08+len),Math.sin(a)*(R*1.08+len));g.stroke()}
+ g.restore();
+ const cr=g.createRadialGradient(cx,cy,0,cx,cy,R*.34);cr.addColorStop(0,'rgba(255,255,255,.95)');cr.addColorStop(.35,`rgba(${col},.85)`);cr.addColorStop(1,`rgba(${col},0)`);
+ g.fillStyle=cr;g.beginPath();g.arc(cx,cy,R*(.3+lvl*.08),0,7);g.fill();
+ requestAnimationFrame(draw)}
+requestAnimationFrame(draw);
+setInterval(()=>$('clock').textContent=new Date().toLocaleTimeString('nl-NL',{hour:'2-digit',minute:'2-digit'}),1000);
+
+/* ---------- start ---------- */
+(async()=>{try{mem=(await kget('mem'))||mem}catch(e){}stats();setState('offline');
+ say('j',S.key?'Systemen online. Tik op de microfoon om me wakker te maken.':'Welkom. Voer je API-key in via ⚙ om te beginnen.');
+ if('serviceWorker'in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
+ navigator.wakeLock?.request('screen').catch(()=>{})})();
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)navigator.wakeLock?.request('screen').catch(()=>{})});
+</script></body></html>
